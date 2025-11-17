@@ -23,9 +23,9 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # 超参数
 BATCH_SIZE   = 128
-NUM_EPOCH    = 50
+NUM_EPOCH    = 200
 NUM_LAYERS   = 6
-NUM_NEURONS  = 128
+NUM_NEURONS  = 256
 NUM_ROUNDS   = 2
 SEQ_LEN      = 1
 LR           = 0.001

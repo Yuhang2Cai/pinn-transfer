@@ -98,7 +98,7 @@ def train_one_stage(condition_name,
     best_path = f"tl_results/best_{condition_name}.pth"
     os.makedirs("tl_results", exist_ok=True)
     early_stopping = EarlyStopping(
-        patience=15,
+        patience=30,
         delta=1e-5,
         save_path=best_path
     )
@@ -174,9 +174,9 @@ def train_one_stage(condition_name,
             print(f"🛑 {condition_name} 提前停止在 epoch {epoch + 1}")
             break
         scheduler.step()
-
-        print(f"[{condition_name}] Epoch {epoch+1}/{NUM_EPOCH}, "
-              f"train_loss={avg_train_loss:.5f}, val_loss={val_loss.item():.5f}")
+        #
+        # print(f"[{condition_name}] Epoch {epoch+1}/{NUM_EPOCH}, "
+        #       f"train_loss={avg_train_loss:.5f}, val_loss={val_loss.item():.5f}")
     # ⭐ 在计算指标前，先加载该工况的最优模型参数
     if os.path.exists(best_path):
         model.load_state_dict(torch.load(best_path, map_location=DEVICE))

@@ -123,10 +123,10 @@ class My_loss(nn.Module):
             batch_loss_M = batch_loss_M + mae_loss
 
         self.loss_physics = batch_loss_physics / num
-        num = random.Random().randint(1, 10)
+        # num = random.Random().randint(1, 10)
         # if num % 5 == 0:
         #     print("loss_M: {:.5f}, loss_physics: {:.5f}".format(self.loss_M.item(), self.loss_physics.item()))
-        # self.loss_M = batch_loss_M / num
-
+        self.loss_M = batch_loss_M / num
+        #
         total_loss = self.loss_M + self.physics_weight * self.loss_physics
         return total_loss
