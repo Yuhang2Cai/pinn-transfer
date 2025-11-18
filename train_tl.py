@@ -298,5 +298,92 @@ def main_tl():
     print(f"TL-PINN 各阶段指标已保存到 {metrics_path}")
     print(f"Training time info saved to {training_info_path}")
 
+    # === 新增：用“最终模型”统一评估四个工况的 test 集，并单独保存 =================
+    print("\n================ 使用最终模型评估四个工况的测试集 ================")
+    final_test_metrics = evaluate_final_model_on_all_tests(
+        final_state_dict=prev_state_dict,  # 最后一个阶段返回的 best state_dict
+        condition_order=condition_order,
+        data_root="data"
+    )
+
+    rows_final = []
+    for cond, m in final_test_metrics.items():
+        rows_final.append({
+            "condition": cond,
+            "split": "test_final_model",
+            "RMSE": m["RMSE"],
+            "MAE": m["MAE"],
+            "MAPE": m["MAPE"],
+            "R2": m["R2"],
+        })
+    df_final = pd.DataFrame(rows_final)
+    final_filename = f"tl_final_model_test_metrics_{timestamp}.csv"
+    final_path = os.path.join("tl_results", final_filename)
+    df_final.to_csv(final_path, index=False)
+
+    print(f"最终模型在四个测试集上的指标已保存到 {final_path}")
+    # ==================================================================
+# === 新增：用“最终模型权重”统一评估四个工况的 test 集 ==================
+def evaluate_final_model_on_all_tests(final_state_dict,
+                                      condition_order,
+                                      data_root="data"):
+    """
+    使用最后阶段得到的最终模型参数（final_state_dict），
+    对每一个工况的 test 集进行统一指标评估。
+    """
+    layers = [NUM_NEURONS] * NUM_LAYERS
+    results = {}
+
+    for cond in condition_order:
+        print(f"\n[Final model] 开始评估工况 {cond} 的 test 集")
+
+        # 1) 读取该工况的 train / test，用 train 算标准化（和 train_one_stage 保持一致）
+        X_train, y_train = load_condition_split_csv(
+            root_dir=data_root, split="train", condition=cond, device=DEVICE
+        )
+        X_test, y_test = load_condition_split_csv(
+            root_dir=data_root, split="test", condition=cond, device=DEVICE
+        )
+
+        num_train = X_train.shape[0]
+        _, mean_inputs_train, std_inputs_train = standardize_tensor(
+            torch.reshape(X_train, (num_train, 1, INPUT_DIM)), mode='fit'
+        )
+        _, mean_targets_train, std_targets_train = standardize_tensor(
+            y_train, mode='fit'
+        )
+
+        # 2) 构建模型并加载“最终模型”的权重
+        model = TriplexPINN(
+            seq_len=1,
+            inputs_dim=INPUT_DIM,
+            outputs_dim=OUTPUT_DIM,
+            layers=layers,
+            scaler_inputs=(mean_inputs_train, std_inputs_train),
+            scaler_targets=(mean_targets_train, std_targets_train)
+        ).to(DEVICE)
+        model.load_state_dict(final_state_dict)
+        model.eval()
+
+        with torch.no_grad():
+            P_pred_test, _ = model(inputs=X_test)
+
+        rmse_test, mae_test, mape_test = calculate_metrics_in_batches(
+            P_pred_test, y_test
+        )
+        r2_test = calculate_r2_in_batches(P_pred_test, y_test)
+
+        print(f"[Final model | {cond} - test] "
+              f"RMSE={rmse_test:.4f}, MAE={mae_test:.4f}, "
+              f"MAPE={mape_test:.2f}, R2={r2_test:.4f}")
+
+        results[cond] = {
+            "RMSE": rmse_test.item(),
+            "MAE": mae_test.item(),
+            "MAPE": mape_test.item(),
+            "R2": r2_test.item()
+        }
+
+    return results
 if __name__ == "__main__":
     main_tl()
