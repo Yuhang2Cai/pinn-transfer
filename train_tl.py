@@ -98,7 +98,7 @@ def train_one_stage(condition_name,
     best_path = f"tl_results/best_{condition_name}.pth"
     os.makedirs("tl_results", exist_ok=True)
     early_stopping = EarlyStopping(
-        patience=30,
+        patience=15,
         delta=1e-5,
         save_path=best_path
     )
@@ -240,7 +240,7 @@ def train_one_stage(condition_name,
 
 def main_tl():
     # 迁移顺序：Normal -> Leak -> Block -> Worn
-    condition_order = ["Normal", "Leak", "Block", "Worn"]
+    condition_order = ["Normal", "Leak", "Worn"]#, "Block"
     physics_weight = 2.0  # 你原来的 My_loss(weight)
 
     prev_state_dict = None
@@ -365,8 +365,8 @@ def evaluate_final_model_on_all_tests(final_state_dict,
         model.load_state_dict(final_state_dict)
         model.eval()
 
-        with torch.no_grad():
-            P_pred_test, _ = model(inputs=X_test)
+
+        P_pred_test, _ = model(inputs=X_test)
 
         rmse_test, mae_test, mape_test = calculate_metrics_in_batches(
             P_pred_test, y_test
