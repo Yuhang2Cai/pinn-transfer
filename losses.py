@@ -75,8 +75,8 @@ class My_loss(nn.Module):
                 exp_term = (base ** exponent) / beta_L_atm
         else:
             if bulk_modulus_model == 'const':
-                with torch.no_grad():
-                    exp_term = torch.exp(-(p_used - p_atm) / beta_L_atm) / beta_L_atm
+                #with torch.no_grad():
+                exp_term = torch.exp(-(p_used - p_atm) / beta_L_atm) / beta_L_atm
             else:
                 base = 1 + beta_gain * (p_used - p_atm) / beta_L_atm
                 exponent = (-1 - 1 / beta_gain)
@@ -104,12 +104,12 @@ class My_loss(nn.Module):
         num = targets_P.shape[0]
         batch_loss_M = torch.tensor(0.0, requires_grad=True)
         batch_loss_physics = torch.tensor(0.0, requires_grad=True)
-
+        valid_count = 0
         for i in range(num):
             if abs(dpdt[i][0]) < 1e-12:
                 print("梯度异常小")
                 continue
-
+            valid_count += 1
             physics_loss = V * self.mixture_density_derivative(
                 outputs_P[i] * 0.1, bulk_modulus_model,
                 air_dissolution_model, rho_L_atm, beta_L_atm, beta_gain,
@@ -122,11 +122,11 @@ class My_loss(nn.Module):
             batch_loss_physics = batch_loss_physics + torch.abs(physics_loss)
             batch_loss_M = batch_loss_M + mae_loss
 
-        self.loss_physics = batch_loss_physics / num
+        self.loss_physics = batch_loss_physics / max(valid_count, 1)
         # num = random.Random().randint(1, 10)
         # if num % 5 == 0:
         #     print("loss_M: {:.5f}, loss_physics: {:.5f}".format(self.loss_M.item(), self.loss_physics.item()))
         self.loss_M = batch_loss_M / num
-        #
+
         total_loss = self.loss_M + self.physics_weight * self.loss_physics
         return total_loss

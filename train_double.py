@@ -1,10 +1,10 @@
-# train_tl.py
+# train_tl.py  /  train_double.py
 import os
 import time
+import random
 
 import numpy as np
 import torch
-import random
 from torch.utils.data import DataLoader
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -16,10 +16,11 @@ from config import (
 from utils import (
     TensorDataset, standardize_tensor,
     calculate_metrics_in_batches, calculate_r2_in_batches,
-    load_condition_split_csv, EarlyStopping
+    load_condition_split_csv
 )
 from models import TriplexPINN
 from losses import My_loss
+
 
 def set_seed(seed=42):
     random.seed(seed)
@@ -31,16 +32,22 @@ def set_seed(seed=42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+
 set_seed(42)
+
+
 def train_one_stage(condition_name,
                     prev_state_dict=None,
                     physics_weight=2.0,
-                    data_root="data"):
+                    data_root="data",
+                    record_epoch_r2=False):
     """
-    训练某一个工况（Normal / Leak / Block / Worn），
-    如果 prev_state_dict 不为 None，就从前一阶段参数继续训练（迁移学习）。
+    训练某一个工况（Normal / Leak / Block / Worn）。
+    - 如果 prev_state_dict 不为 None，就从给定参数初始化（用于 Normal -> Fault 的迁移）。
+    - 如果 record_epoch_r2=True，则在每个 epoch 记录当前模型在 test 集上的 R2，
+      最后自动保存 CSV 和 曲线图。
+    - 不使用早停，固定训练 NUM_EPOCH 轮，但会保存 val_loss 最优的 checkpoint。
     """
-    #单独训练
     prev_state_dict = None
     print(f"\n============================")
     print(f"开始训练工况: {condition_name}")
@@ -75,7 +82,7 @@ def train_one_stage(condition_name,
     train_loader = DataLoader(
         train_set,
         batch_size=BATCH_SIZE,
-        shuffle=False,
+        shuffle=False,  # 和你原来的设置保持一致
         num_workers=0,
         drop_last=True
     )
@@ -84,23 +91,24 @@ def train_one_stage(condition_name,
     layers = [NUM_NEURONS] * NUM_LAYERS
     model = TriplexPINN(
         seq_len=1,
-        inputs_dim=INPUT_DIM,
+        inputs_dim= INPUT_DIM,
         outputs_dim=OUTPUT_DIM,
         layers=layers,
         scaler_inputs=(mean_inputs_train, std_inputs_train),
         scaler_targets=(mean_targets_train, std_targets_train)
     ).to(DEVICE)
 
-    # 如果有前一阶段参数，则迁移
+    # 如果有前一阶段参数，则迁移（例如 Normal -> Leak）
     if prev_state_dict is not None:
         model.load_state_dict(prev_state_dict)
 
     # 5. 损失函数 & 优化器
     criterion = My_loss()
     if condition_name == "Leak":
-        lr = LR * 0.5  # 或者更小
+        lr = LR * 0.5  # 你原来的特例
     else:
         lr = LR
+
     optimizer = torch.optim.Adam(
         list(model.parameters()) + list(criterion.parameters()),
         lr=lr
@@ -109,18 +117,29 @@ def train_one_stage(condition_name,
 
     train_losses = []
     val_losses = []
-    lambda_history = []  # �� 记录每个 epoch 的物理权重 λ
-    # ⭐⭐ 6. 创建 EarlyStopping（每个工况一个独立 best_xxx.pth） ⭐⭐
+    lambda_history = []      # 记录每个 epoch 的物理权重 λ
+    r2_epoch_history = []    # ⭐ 记录每个 epoch 的 test R2
+
+    # checkpoint 路径（保存 val_loss 最优模型）
     best_path = f"tl_results/best_{condition_name}.pth"
     os.makedirs("tl_results", exist_ok=True)
-    early_stopping = EarlyStopping(
-        patience=15,
-        delta=1e-5,
-        save_path=best_path
-    )
-    if condition_name == "Leak":
-        early_stopping.patience = 30
-    # 6. 训练循环（和你原来的 train() 几乎一样）
+    best_val_loss = float('inf')
+    delta = 1e-5  # 和原来 EarlyStopping 里的 delta 类似
+
+    # ⭐ 如果需要记录 R2，先算一次 epoch=0 的 test R2（迁移前 / 训练前）
+    if record_epoch_r2:
+        model.eval()
+        # 关键：需要梯度来算 P_t，所以不能用 no_grad，要给输入开 requires_grad
+        inputs_test.requires_grad_(True)
+        P_pred_test0, _ = model(inputs=inputs_test)
+        r2_0 = calculate_r2_in_batches(P_pred_test0, targets_test).item()
+        r2_epoch_history.append(r2_0)
+        print(f"[{condition_name}] Epoch 0 (before fine-tune), test R2={r2_0:.4f}")
+    else:
+        # 确保 test 不影响后面训练
+        inputs_test.requires_grad_(False)
+
+    # 7. 训练循环（不早停，跑满 NUM_EPOCH）
     for epoch in range(NUM_EPOCH):
         model.train()
         epoch_train_loss = 0.0
@@ -178,53 +197,68 @@ def train_one_stage(condition_name,
             p_crit=3,
             p_min=1
         )
-        val_losses.append(val_loss.item())
-        # 记录当前 epoch 的 λ
+        cur_val = val_loss.item()
+        val_losses.append(cur_val)
         lambda_history.append(criterion.physics_weight.item())
-        # �� 调用早停
-        early_stopping(val_loss.item(), model)
 
-        print(f"[{condition_name}] Epoch {epoch + 1}/{NUM_EPOCH}, "
-              f"train_loss={avg_train_loss:.5f}, val_loss={val_loss.item():.5f}, "
-              f"lambda={criterion.physics_weight.item():.4f}")
+        # ⭐ 如果当前 val_loss 更好，则更新 best checkpoint
+        if cur_val < best_val_loss - delta:
+            best_val_loss = cur_val
+            torch.save(model.state_dict(), best_path)
 
-        if early_stopping.early_stop:
-            print(f"�� {condition_name} 提前停止在 epoch {epoch + 1}")
-            break
+        # ⭐ 每个 epoch 计算一次 test R2
+        if record_epoch_r2:
+            model.eval()
+            # 已经在前面设置过 requires_grad_(True)，持续有效
+            P_pred_test, _ = model(inputs=inputs_test)
+            r2_e = calculate_r2_in_batches(P_pred_test, targets_test).item()
+            r2_epoch_history.append(r2_e)
+
+        log_msg = (f"[{condition_name}] Epoch {epoch + 1}/{NUM_EPOCH}, "
+                   f"train_loss={avg_train_loss:.5f}, val_loss={cur_val:.5f}, "
+                   f"lambda={criterion.physics_weight.item():.4f}")
+        if record_epoch_r2:
+            log_msg += f", test_R2={r2_epoch_history[-1]:.4f}"
+        print(log_msg)
+
         scheduler.step()
-        #
-        # print(f"[{condition_name}] Epoch {epoch+1}/{NUM_EPOCH}, "
-        #       f"train_loss={avg_train_loss:.5f}, val_loss={val_loss.item():.5f}")
-    # ⭐ 在计算指标前，先加载该工况的最优模型参数
+
+    # 8. 加载该工况的最优模型参数（按 val_loss 最小）
     if os.path.exists(best_path):
         model.load_state_dict(torch.load(best_path, map_location=DEVICE))
-        print(f"✔ 使用 {condition_name} 的最佳模型参数进行评估")
+        print(f"✔ 使用 {condition_name} 的最佳模型参数进行评估 (val_loss={best_val_loss:.5f})")
     else:
         print(f"⚠ 未找到 {best_path}，使用最后一轮模型评估")
-        # �� 保存该工况训练过程中 λ 的变化曲线（csv + png）
-        if len(lambda_history) > 0:
-            lambda_df = pd.DataFrame({
-                "epoch": np.arange(1, len(lambda_history) + 1),
-                "lambda": lambda_history
-            })
-            lambda_csv_path = os.path.join("tl_results", f"lambda_{condition_name}.csv")
-            lambda_df.to_csv(lambda_csv_path, index=False)
-            print(f"✔ {condition_name} 的 λ 变化已保存到: {lambda_csv_path}")
 
-            # 画 λ 曲线图
-            plt.figure(figsize=(8, 4))
-            plt.plot(lambda_df["epoch"], lambda_df["lambda"], marker="o")
-            plt.xlabel("Epoch")
-            plt.ylabel("Lambda (physics_weight)")
-            plt.title(f"Lambda evolution - {condition_name}")
-            plt.grid(True)
+    # ⭐ 保存每 epoch 的 test R2 曲线（只对 record_epoch_r2=True 的情况）
+    if record_epoch_r2 and len(r2_epoch_history) > 0:
+        r2_df = pd.DataFrame({
+            "epoch": np.arange(len(r2_epoch_history)),  # 从 0 开始：0=初始化
+            "R2_test": r2_epoch_history
+        })
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        r2_csv_path = os.path.join("tl_results", f"r2_epoch_{condition_name}_{timestamp}.csv")
+        r2_png_path = os.path.join("tl_results", f"r2_epoch_{condition_name}_{timestamp}.png")
+        r2_df.to_csv(r2_csv_path, index=False)
+        print(f"✔ {condition_name} 的 R2-epoch 曲线数据已保存到: {r2_csv_path}")
 
-            lambda_png_path = os.path.join("tl_results", f"lambda_{condition_name}.png")
-            plt.savefig(lambda_png_path, dpi=300, bbox_inches="tight")
-            plt.close()
-            print(f"✔ {condition_name} 的 λ 曲线图已保存到: {lambda_png_path}")
-    # 7. 在 train/val/test 上分别算指标
+        # 画 R2 曲线图
+        plt.figure(figsize=(8, 4))
+        plt.plot(r2_df["epoch"], r2_df["R2_test"], linewidth=1.5)
+        plt.xlabel("Fine-tuning epoch")
+        plt.ylabel("Test R2")
+        plt.title(f"Test R2 vs Epoch (Normal → {condition_name})")
+        plt.grid(True)
+        plt.savefig(r2_png_path, dpi=300, bbox_inches="tight")
+        plt.close()
+        print(f"✔ {condition_name} 的 R2 曲线图已保存到: {r2_png_path}")
+
+    # 9. 用“最佳模型”在 train/val/test 上分别算最终指标
     model.eval()
+    inputs_train.requires_grad_(True)
+    inputs_val.requires_grad_(True)
+    inputs_test.requires_grad_(True)
+
     P_pred_train, _ = model(inputs=inputs_train)
     P_pred_val, _ = model(inputs=inputs_val)
     P_pred_test, _ = model(inputs=inputs_test)
@@ -246,44 +280,68 @@ def train_one_stage(condition_name,
                   "MAPE": mape_test.item(),  "R2": r2_test.item()},
     }
 
-    print(f"\n[{condition_name}] 指标：")
+    print(f"\n[{condition_name}] 最终指标：")
     for split in ["train", "val", "test"]:
         m = metrics[split]
         print(f"  {split}: RMSE={m['RMSE']:.4f}, MAE={m['MAE']:.4f}, "
               f"MAPE={m['MAPE']:.2f}, R2={m['R2']:.4f}")
 
-    # 返回当前模型的参数（用于迁移）和指标
+    # 返回当前模型的参数（用于后续迁移）和指标
     return model.state_dict(), metrics, (train_losses, val_losses)
 
 
 def main_tl():
-    # 迁移顺序：Normal -> Leak -> Block -> Worn , "Block"
-    condition_order = ["Normal", "Worn", "Leak"]
-    # condition_order = ["Leak"]
-    physics_weight = 2.0  # 你原来的 My_loss(weight)
+    """
+    先训练 Normal 工况（无迁移），得到 base 模型参数；
+    然后分别执行多次迁移：
+        Normal -> Leak
+        Normal -> Block
+        Normal -> Worn
 
-    prev_state_dict = None
+    对每个故障工况，在训练过程中记录每个 epoch 的 test R2，
+    并自动保存 r2_epoch_xxx.csv 和 r2_epoch_xxx.png。
+    """
+    physics_weight = 2.0
+    os.makedirs("tl_results", exist_ok=True)
+
     all_stage_metrics = {}
     all_stage_losses = {}
-    start_time = time.time()
-    for idx, cond in enumerate(condition_order):
-        # 第一个工况 prev_state_dict=None -> 随机初始化
-        # 后面的工况 prev_state_dict!=None -> 迁移学习
-        prev_state_dict, metrics, losses = train_one_stage(
-            condition_name=cond,
-            prev_state_dict=prev_state_dict,
-            physics_weight=physics_weight,
-            data_root="data"
-        )
 
+    start_time = time.time()
+
+    # 1) 先训练 Normal（只训一次，作为所有迁移的源模型）
+    print("\n================ 训练 Normal（基模型） ================")
+    normal_state_dict, normal_metrics, normal_losses = train_one_stage(
+        condition_name="Normal",
+        prev_state_dict=None,
+        physics_weight=physics_weight,
+        data_root="data",
+        record_epoch_r2=False  # Normal 不记录 epoch R2
+    )
+    all_stage_metrics["Normal"] = normal_metrics
+    all_stage_losses["Normal"] = normal_losses
+
+    # 2) 对每个故障工况：从 Normal 的参数出发进行迁移学习
+    # 如果暂时没有 Block 数据，可以改成 ["Leak", "Worn"]
+    target_conditions = ["Leak", "Worn","Block"]  # 没有 Block 的话就这样写
+
+    for cond in target_conditions:
+        print(f"\n================ Normal → {cond} 迁移训练 ================")
+        # 每个故障工况都从同一个 normal_state_dict 初始化
+        state_dict, metrics, losses = train_one_stage(
+            condition_name=cond,
+            prev_state_dict=normal_state_dict,
+            physics_weight=physics_weight,
+            data_root="data",
+            record_epoch_r2=True   # ⭐ 故障工况：记录 epoch 的 test R2
+        )
         all_stage_metrics[cond] = metrics
-        all_stage_losses[cond] = losses  # (train_losses, val_losses)
-        # Record end time and calculate total duration
+        all_stage_losses[cond] = losses
+
     end_time = time.time()
     total_training_time = end_time - start_time
-    # 可以把 all_stage_metrics 存成一个 json / csv，方便论文画图/做表
-    os.makedirs("tl_results", exist_ok=True)
-    # Generate timestamp for unique filenames
+
+    # 3) 把所有阶段的最终指标存到 CSV
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     rows = []
     for cond, ms in all_stage_metrics.items():
@@ -297,16 +355,14 @@ def main_tl():
                 "R2": ms[split]["R2"],
             })
     df = pd.DataFrame(rows)
-    # Include timestamp and training time in the filename
     metrics_filename = f"tl_stage_metrics_{timestamp}.csv"
     metrics_path = os.path.join("tl_results", metrics_filename)
     df.to_csv(metrics_path, index=False)
 
-    # Save training time to a separate file
     training_info = {
         "timestamp": timestamp,
         "total_training_time_seconds": total_training_time,
-        "conditions_trained": ", ".join(condition_order)
+        "conditions_trained": ", ".join(["Normal"] + target_conditions)
     }
     training_info_df = pd.DataFrame([training_info])
     training_info_filename = f"training_time_{timestamp}.csv"
@@ -314,95 +370,9 @@ def main_tl():
     training_info_df.to_csv(training_info_path, index=False)
 
     print(f"\nTotal training time: {total_training_time:.2f} seconds")
-    print(f"TL-PINN 各阶段指标已保存到 {metrics_path}")
+    print(f"TL-PINN 各阶段最终指标已保存到 {metrics_path}")
     print(f"Training time info saved to {training_info_path}")
 
-    # === 新增：用“最终模型”统一评估四个工况的 test 集，并单独保存 =================
-    print("\n================ 使用最终模型评估四个工况的测试集 ================")
-    condition_order = ["Normal", "Worn","Leak"]
-    final_test_metrics = evaluate_final_model_on_all_tests(
-        final_state_dict=prev_state_dict,  # 最后一个阶段返回的 best state_dict
-        condition_order=condition_order,
-        data_root="data"
-    )
 
-    rows_final = []
-    for cond, m in final_test_metrics.items():
-        rows_final.append({
-            "condition": cond,
-            "split": "test_final_model",
-            "RMSE": m["RMSE"],
-            "MAE": m["MAE"],
-            "MAPE": m["MAPE"],
-            "R2": m["R2"],
-        })
-    df_final = pd.DataFrame(rows_final)
-    final_filename = f"tl_final_model_test_metrics_{timestamp}.csv"
-    final_path = os.path.join("tl_results", final_filename)
-    df_final.to_csv(final_path, index=False)
-
-    print(f"最终模型在四个测试集上的指标已保存到 {final_path}")
-    # ==================================================================
-# === 新增：用“最终模型权重”统一评估四个工况的 test 集 ==================
-def evaluate_final_model_on_all_tests(final_state_dict,
-                                      condition_order,
-                                      data_root="data"):
-    """
-    使用最后阶段得到的最终模型参数（final_state_dict），
-    对每一个工况的 test 集进行统一指标评估。
-    """
-    layers = [NUM_NEURONS] * NUM_LAYERS
-    results = {}
-
-    for cond in condition_order:
-        print(f"\n[Final model] 开始评估工况 {cond} 的 test 集")
-
-        # 1) 读取该工况的 train / test，用 train 算标准化（和 train_one_stage 保持一致）
-        X_train, y_train = load_condition_split_csv(
-            root_dir=data_root, split="train", condition=cond, device=DEVICE
-        )
-        X_test, y_test = load_condition_split_csv(
-            root_dir=data_root, split="test", condition=cond, device=DEVICE
-        )
-
-        num_train = X_train.shape[0]
-        _, mean_inputs_train, std_inputs_train = standardize_tensor(
-            torch.reshape(X_train, (num_train, 1, INPUT_DIM)), mode='fit'
-        )
-        _, mean_targets_train, std_targets_train = standardize_tensor(
-            y_train, mode='fit'
-        )
-
-        # 2) 构建模型并加载“最终模型”的权重
-        model = TriplexPINN(
-            seq_len=1,
-            inputs_dim=INPUT_DIM,
-            outputs_dim=OUTPUT_DIM,
-            layers=layers,
-            scaler_inputs=(mean_inputs_train, std_inputs_train),
-            scaler_targets=(mean_targets_train, std_targets_train)
-        ).to(DEVICE)
-        model.load_state_dict(final_state_dict)
-        model.eval()
-
-        P_pred_test, _ = model(inputs=X_test)
-
-        rmse_test, mae_test, mape_test = calculate_metrics_in_batches(
-            P_pred_test, y_test
-        )
-        r2_test = calculate_r2_in_batches(P_pred_test, y_test)
-
-        print(f"[Final model | {cond} - test] "
-              f"RMSE={rmse_test:.4f}, MAE={mae_test:.4f}, "
-              f"MAPE={mape_test:.2f}, R2={r2_test:.4f}")
-
-        results[cond] = {
-            "RMSE": rmse_test.item(),
-            "MAE": mae_test.item(),
-            "MAPE": mape_test.item(),
-            "R2": r2_test.item()
-        }
-
-    return results
 if __name__ == "__main__":
     main_tl()
