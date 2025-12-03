@@ -36,6 +36,7 @@ NUM_NEURONS = 128
 NUM_ROUNDS = 2
 SEQ_LEN = 1
 LR = 0.001
+ACTIVATION = 'Tanh'
 
 
 class Swish(nn.Module):
@@ -44,7 +45,7 @@ class Swish(nn.Module):
 
 
 def train(num_epoch, batch_size, train_loader, num_slices_train, inputs_val, targets_val,
-          model, optimizer, scheduler, criterion):
+          model, optimizer, scheduler, criterion, use_lbfgs=False, lbfgs_max_iter=20, lbfgs_lr=0.5):
     num_period = int(num_slices_train / batch_size)
     train_losses = []  # 记录训练损失
     val_losses = []  # 记录验证损失
@@ -119,6 +120,71 @@ def train(num_epoch, batch_size, train_loader, num_slices_train, inputs_val, tar
         val_losses.append(val_loss.item())
 
         scheduler.step()
+
+    # optional LBFGS fine-tuning after Adam
+    if use_lbfgs and lbfgs_max_iter > 0:
+        model.train()
+        lbfgs_optimizer = optim.LBFGS(
+            list(model.parameters()),
+            lr=lbfgs_lr,
+            max_iter=lbfgs_max_iter,
+            line_search_fn="strong_wolfe",
+        )
+
+        def closure():
+            lbfgs_optimizer.zero_grad()
+            total_loss = 0.0
+            for inputs_train_batch, targets_train_batch in train_loader:
+                p_pred, P_t_pred = model(inputs=inputs_train_batch)
+                loss_batch = criterion(
+                    targets_P=targets_train_batch,
+                    outputs_P=p_pred,
+                    dpdt=P_t_pred,
+                    mdot_A=inputs_train_batch[:, 2],
+                    V=2 * np.exp(-4),
+                    bulk_modulus_model='const',
+                    air_dissolution_model='off',
+                    rho_L_atm=851.6,
+                    beta_L_atm=1.46696e+03,
+                    beta_gain=0.2,
+                    air_fraction=0.005,
+                    rho_g_atm=1.225,
+                    polytropic_index=1.0,
+                    p_atm=0.101325,
+                    p_crit=3,
+                    p_min=1
+                )
+                total_loss = total_loss + loss_batch
+            total_loss = total_loss / len(train_loader)
+            total_loss.backward()
+            return total_loss
+
+        final_loss = lbfgs_optimizer.step(closure)
+        train_losses.append(final_loss.item())
+
+        # recompute val loss after LBFGS
+        model.eval()
+        inputs_val.requires_grad_(True)
+        P_pred_val, P_t_pred_val = model(inputs=inputs_val)
+        val_loss = criterion(
+            targets_P=targets_val,
+            outputs_P=P_pred_val,
+            dpdt=P_t_pred_val,
+            mdot_A=inputs_val[:, 2],
+            V=2 * np.exp(-4),
+            bulk_modulus_model='const',
+            air_dissolution_model='off',
+            rho_L_atm=851.6,
+            beta_L_atm=1.46696e+03,
+            beta_gain=0.2,
+            air_fraction=0.005,
+            rho_g_atm=1.225,
+            polytropic_index=1.0,
+            p_atm=0.101325,
+            p_crit=3,
+            p_min=1
+        )
+        val_losses.append(val_loss.item())
 
     return model, train_losses, val_losses
 
@@ -284,57 +350,53 @@ def calculate_r2_in_batches(predictions, targets, batch_size=1024):
 
 
 class Neural_Net(nn.Module):
-    def __init__(self, seq_len, inputs_dim, outputs_dim, layers, activation='Sin'):
+    def __init__(self, seq_len, inputs_dim, outputs_dim, layers, activation='Tanh'):
         super(Neural_Net, self).__init__()
         self.seq_len = seq_len
         self.inputs_dim = inputs_dim
         self.outputs_dim = outputs_dim
 
-        # 强制所有层使用 float64 类型
-        self.layers = nn.ModuleList()  # 使用 ModuleList 替代普通 list 以正确注册子模块
+        # use float64 everywhere
+        self.layers = nn.ModuleList()
 
-        # 第一层
-        layer = nn.Linear(inputs_dim, layers[0]).double()  # 创建后立即转为 double
+        # input layer
+        layer = nn.Linear(inputs_dim, layers[0]).double()
         nn.init.xavier_normal_(layer.weight)
         self.layers.append(layer)
-
-        # 激活函数和 Dropout（无参数，无需修改类型）
-        if activation == 'Tanh':
-            self.layers.append(nn.Tanh())
-        elif activation == 'Sin':
-            self.layers.append(Swish())
+        self.layers.append(self._get_activation(activation))
         self.layers.append(nn.Dropout(p=0.2))
 
-        # 中间层
+        # hidden layers
         for l in range(len(layers) - 1):
-            layer = nn.Linear(layers[l], layers[l + 1]).double()  # 转为 double
+            layer = nn.Linear(layers[l], layers[l + 1]).double()
             nn.init.xavier_normal_(layer.weight)
             self.layers.append(layer)
-
-            if activation == 'Tanh':
-                self.layers.append(nn.Tanh())
-            elif activation == 'Sin':
-                self.layers.append(Swish())
+            self.layers.append(self._get_activation(activation))
             self.layers.append(nn.Dropout(p=0.2))
 
-        # 输出层
-        layer = nn.Linear(layers[-1], outputs_dim).double()  # 转为 double
+        # output layer
+        layer = nn.Linear(layers[-1], outputs_dim).double()
         nn.init.xavier_normal_(layer.weight)
         self.layers.append(layer)
 
-        # 构建 Sequential
         self.NN = nn.Sequential(*self.layers)
 
+    def _get_activation(self, activation):
+        act = activation.lower()
+        if act == 'tanh':
+            return nn.Tanh()
+        if act == 'sin':
+            return Sin()
+        if act == 'swish':
+            return Swish()
+        return nn.Tanh()
+
     def forward(self, x):
-        # 确保输入转为 double
         x = x.double() if x.dtype != torch.float64 else x
-
         self.x = x.contiguous().view(-1, self.inputs_dim)
-        NN_out_2D = self.NN(self.x)  # 输入已确保为 double
+        NN_out_2D = self.NN(self.x)
         self.p_pred = NN_out_2D.view(-1, self.seq_len, self.outputs_dim)
-
         return self.p_pred
-
 
 class My_loss(nn.Module):
     def __init__(self, physics_weight=4):  # 添加物理损失权重参数
@@ -484,7 +546,8 @@ class TriplexPINN(nn.Module):
             seq_len=self.seq_len,
             inputs_dim=self.inputs_dim,
             outputs_dim=self.outputs_dim,
-            layers=layers
+            layers=layers,
+            activation=ACTIVATION
         )
 
     def forward(self, inputs):
@@ -529,24 +592,33 @@ def main(weight):
 
     # 1. 数据加载和预处理
     print("1. 加载和预处理数据...")
-    data = pd.read_csv('combined_all_t_p.csv')
+    train_data = pd.read_csv('data\WornTrain.csv')
+    train_data_X = train_data.drop(['pOut'], axis=1)
+    train_data_Y = train_data['pOut']
 
+    val_data = pd.read_csv('data/val/WornVal.csv')
+    val_data_X = val_data.drop(['pOut'], axis=1)
+    val_data_Y = val_data['pOut']
+
+    test_data = pd.read_csv('data/test/WornTest.csv')
+    test_data_X = test_data.drop(['pOut'], axis=1)
+    test_data_Y = test_data['pOut']
     # 修改：去掉最后一列'imotor'，只保留前三列作为输入
-    X = data.drop(['pOut', 'iMotor'], axis=1)  # 去掉目标列和不需要的列
-    Y = data['pOut']
-
+    # X = data.drop(['pOut', 'iMotor'], axis=1)  # 去掉目标列和不需要的列
+    # Y = data['pOut']
+    
     # 按时间顺序划分训练集、验证集和测试集 (70%, 15%, 15%)
-    train_size = int(len(X) * 0.7)
-    val_size = int(len(X) * 0.15)
-
+    # train_size = int(len(X) * 0.7)
+    # val_size = int(len(X) * 0.15)
+    
     # 划分数据集
-    X_train = X.iloc[:train_size]
-    y_train = Y.iloc[:train_size]
-    X_val = X.iloc[train_size:train_size + val_size]
-    y_val = Y.iloc[train_size:train_size + val_size]
-    X_test = X.iloc[train_size + val_size:]
-    y_test = Y.iloc[train_size + val_size:]
-
+    X_train = train_data_X.iloc[:]
+    y_train = train_data_Y.iloc[:]
+    X_val = val_data_X.iloc[:]
+    y_val = val_data_Y.iloc[:]
+    X_test = test_data_X.iloc[:]
+    y_test = test_data_Y.iloc[:]
+    
     # 转换为torch.Tensor
     X_train_tensor = torch.tensor(X_train.values, dtype=torch.float64)
     y_train_tensor = torch.tensor(y_train.values, dtype=torch.float64).unsqueeze(1)
@@ -634,7 +706,10 @@ def main(weight):
             model=model,
             optimizer=optimizer,
             scheduler=scheduler,
-            criterion=criterion
+            criterion=criterion,
+            use_lbfgs=True,
+            lbfgs_max_iter=50,
+            lbfgs_lr=0.5
         )
 
         all_train_losses.append(train_losses)
